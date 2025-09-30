@@ -10,6 +10,7 @@
 ### :book: Table Of Contents
 - [:computer: Train](#computer-train)
 - [:zap: Inference](#inference)
+- [:star: Editing](#editing)
 - [:heart: Acknowledgement](#acknowledgement)
 - [:clipboard: Citation](#cite)
 
@@ -78,7 +79,7 @@ python test_compressor.py --type face --config face_stage2 \
 --save_path ./output/face_idx5_channel8_lamb003_checkpoint/
 ```
 
-### <a name="Editing"></a>:star: Editing
+### <a name="editing"></a>:star: Editing
 
 Run the following command to edit face images and car images.
 
