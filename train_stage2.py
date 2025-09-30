@@ -1,0 +1,196 @@
+import argparse
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.data as data
+import yaml
+import subprocess
+
+from PIL import Image
+from tqdm import tqdm
+from torchvision import transforms, utils
+from tensorboard_logger import Logger
+
+from utils.datasets import *
+from utils.functions import *
+
+
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = True
+torch.autograd.set_detect_anomaly(True)
+Image.MAX_IMAGE_PIXELS = None
+device = torch.device('cuda')
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--config', type=str, default='001', help='Path to the config file.')
+parser.add_argument('--type', type=str, default='face', help='dataset class: face or church or car')
+parser.add_argument('--real_dataset_path', type=str, default='./data/ffhq', help='dataset path')
+parser.add_argument('--test_path', type=str, default='./data/celeba_hq/', help='dataset path')
+parser.add_argument('--dataset_path', type=str, default='./data/stylegan2-generate-images/ims/', help='dataset path')
+parser.add_argument('--label_path', type=str, default='./data/stylegan2-generate-images/seeds_pytorch_1.8.1.npy', help='laebl path')
+parser.add_argument('--arcface_model_path', type=str, default='./pretrained_models/backbone.pth', help='pretrained arcface model')
+parser.add_argument('--parsing_model_path', type=str, default='./pretrained_models/79999_iter.pth', help='pretrained parsing model')
+parser.add_argument('--log_path', type=str, default='./logs/', help='log file path')
+parser.add_argument('--resume', action='store_true', help='resume from checkpoint')
+parser.add_argument('--checkpoint', type=str, default='', help='checkpoint file path')
+opts = parser.parse_args()
+
+if opts.type == 'church':
+    from nets.trainer_channel_church import *
+    stylegan_model_path = './pretrained_models/stylegan2_pth/e4e_church_encode.pt'
+elif opts.type == 'face':
+    from nets.trainer_channel_face import *
+    stylegan_model_path = './pretrained_models/stylegan2_pth/psp_ffhq_encode.pt'
+elif opts.type == 'car':
+    from nets.trainer_channel_car import *
+    stylegan_model_path = './pretrained_models/stylegan2_pth/e4e_cars_encode.pt'
+
+is_car = True if opts.type == 'car' else False
+
+log_dir = os.path.join(opts.log_path, opts.config) + '/'
+os.makedirs(log_dir, exist_ok=True)
+logger = Logger(log_dir)
+
+config = yaml.load(open('./configs/' + opts.config + '.yaml', 'r'), Loader=yaml.FullLoader)
+
+batch_size = config['batch_size']
+epochs = config['epochs']
+iter_per_epoch = config['iter_per_epoch']
+img_size = (config['resolution'], config['resolution'])
+video_data_input = False
+
+epoch_compresslatent = config["epoch_compresslatent"]
+epoch_compressfeature = config["epoch_compressfeature"]
+
+
+img_to_tensor = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
+img_to_tensor_car = transforms.Compose([
+    transforms.Resize((384, 512)),
+    transforms.Pad(padding=(0, 64, 0, 64)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
+
+img_to_tensor_church = transforms.Compose([
+    transforms.Resize((256, 256)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
+
+# Initialize trainer
+trainer = Trainer(config, opts)
+trainer.initialize(stylegan_model_path, opts.arcface_model_path, opts.parsing_model_path)   
+trainer.to(device)
+
+noise_exemple = trainer.noise_inputs
+train_data_split = 0.9 if 'train_split' not in config else config['train_split']
+
+# Load synthetic dataset
+dataset_A = MyDataSet(image_dir=opts.dataset_path, label_dir=opts.label_path, output_size=img_size, noise_in=noise_exemple, training_set=True, train_split=train_data_split, is_car=is_car)
+loader_A = data.DataLoader(dataset_A, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+# Load real dataset
+dataset_B = MyDataSet(image_dir=opts.real_dataset_path, label_dir=None, output_size=img_size, noise_in=noise_exemple, training_set=True, train_split=train_data_split, is_car=is_car)
+loader_B = data.DataLoader(dataset_B, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+
+# Start Training
+epoch_0 = 0
+
+# check if checkpoint exist
+if 'checkpoint.pth' in os.listdir(log_dir):
+    epoch_0 = trainer.load_checkpoint(os.path.join(log_dir, 'checkpoint.pth'))
+
+if opts.resume:
+    epoch_0 = trainer.load_checkpoint(os.path.join(opts.log_path, opts.checkpoint))
+
+if 'pretrained_encoder' in config:
+    trainer.enc.load_state_dict(torch.load(config['pretrained_encoder']))
+    print(f"Load pretrained encoder model from {config['pretrained_encoder']}")
+
+torch.manual_seed(0)
+os.makedirs(log_dir + 'validation/', exist_ok=True)
+compressed_stage = 1
+
+print("Start!")
+
+for param in trainer.enc.parameters():
+    param.requires_grad = False
+
+
+trainer.enc.eval()
+
+for n_epoch in tqdm(range(epoch_0, epochs)):
+
+    iter_A = iter(loader_A)
+    iter_B = iter(loader_B)
+    iter_0 = n_epoch*iter_per_epoch
+
+    for n_iter in range(iter_0, iter_0 + iter_per_epoch):
+        
+        if opts.dataset_path is None:
+            z, noise = next(iter_A)
+            img_A = None
+        else:
+            z, img_A, noise = next(iter_A)
+            img_A = img_A.to(device)
+
+        z = z.to(device)
+        noise = [ee.to(device) for ee in noise]
+        w = trainer.mapping(z)
+        if 'fixed_noise' in config and config['fixed_noise']:
+            img_A, noise = None, None
+
+        img_B = None
+        if 'use_realimg' in config and config['use_realimg']:
+            try:
+                img_B = next(iter_B)
+                if img_B.size(0) != batch_size:
+                    iter_B = iter(loader_B)
+                    img_B = next(iter_B)
+            except StopIteration:
+                iter_B = iter(loader_B)
+                img_B = next(iter_B)
+            img_B = img_B.to(device)
+            
+
+        latent, feature = trainer.get_feature_latent(w=w, img=img_A, noise=noise, real_img=img_B, n_iter=n_iter)
+        trainer.compute_compressed_loss_stylegan2(w=w, img=img_A, noise=noise, real_img=img_B, compressed_stage=compressed_stage)
+        if n_epoch < epoch_compresslatent:
+            trainer.update_latent(latent=latent, n_iter=n_iter)
+            compressed_stage = 1
+        elif n_epoch < epoch_compressfeature and n_epoch >= epoch_compresslatent:
+            trainer.update_feature(feature=feature, latent=latent, n_iter=n_iter)
+            compressed_stage = 2
+        else:
+            compressed_latent, compressed_feature = trainer.update_both(feature=feature, latent=latent, n_iter=0)
+            compressed_stage = 3
+        if (n_iter+1) % config['log_iter'] == 0:
+            trainer.log_loss(logger, n_iter, prefix='train')
+        if (n_iter+1) % config['image_save_iter'] == 0:
+            trainer.save_compressed_image(log_dir, n_epoch, n_iter, prefix='/train/', w=w, img=img_A, noise=noise, training_mode=False, compressed_stage=compressed_stage)
+            trainer.save_compressed_image(log_dir, n_epoch, n_iter+1, prefix='/train/', w=w, img=img_B, noise=noise, training_mode=False, compressed_stage=compressed_stage)
+            
+    trainer.save_checkpoint(n_epoch, log_dir)
+    
+    # Test the model on celeba hq dataset
+    with torch.no_grad():
+        trainer.enc.eval()
+        for i in range(10):
+            if opts.type == 'car':
+                image_A = img_to_tensor_car(Image.open(f'{opts.test_path}{i}.jpg')).unsqueeze(0).to(device)
+            elif opts.type == 'church':
+                image_A = img_to_tensor_church(Image.open('./data/church_validation/%d.jpg' % i)).unsqueeze(0).to(device)
+            else:
+                image_A = img_to_tensor(Image.open(f'{opts.test_path}{i}.jpg')).unsqueeze(0).to(device)
+            output = trainer.compressed_test(img=image_A, compressed_stage=compressed_stage)
+            out_img = torch.cat(output, 3)
+            utils.save_image(clip_img(out_img[:1]), log_dir + 'validation/' + 'epoch_' +str(n_epoch+1) + '_' + str(i) + '.jpg')
+        trainer.compute_compressed_loss_stylegan2(w=w, img=img_A, noise=noise, real_img=img_B, compressed_stage=compressed_stage)
+        trainer.log_loss(logger, n_iter, prefix='validation')
+
+trainer.save_model(log_dir)
