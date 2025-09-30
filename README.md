@@ -79,6 +79,10 @@ python test_compressor.py --type face --config face_stage2 \
 --save_path ./output/face_idx5_channel8_lamb003_checkpoint/
 ```
 
+<p align="center">
+    <img src="assets/curve.png" style="border-radius: 15px"><br>
+</p>
+
 ### <a name="editing"></a>:star: Editing
 
 Run the following command to edit face images and car images.
